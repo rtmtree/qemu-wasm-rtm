@@ -1,0 +1,7 @@
+{
+  "name": "ONESHOT",
+  "title": "ONE SHOT",
+  "exe": "ONE SHOT.exe",
+  "renderer": "qemu",
+  "baked": true
+}

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "wineframe",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["site/serve.py"],
+      "port": 8123
+    }
+  ]
+}

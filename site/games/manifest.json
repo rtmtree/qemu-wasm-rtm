@@ -1,0 +1,17 @@
+{
+  "games": [
+    {
+      "app": "DinoWalkSim",
+      "title": "Dino Walk Sim",
+      "exe": "DinoWalkSim.exe",
+      "renderer": "native"
+    },
+    {
+      "app": "LIGHTHOUSE",
+      "title": "Lighthouse (Ludum Dare 59 / AGS)",
+      "exe": "Ludum Dare 59 AGS.exe",
+      "renderer": "qemu",
+      "baked": true
+    }
+  ]
+}

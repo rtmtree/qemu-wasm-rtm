@@ -1,0 +1,7 @@
+{
+  "name": "DinoWalkSim",
+  "title": "Dino Walk Sim",
+  "exe": "DinoWalkSim.exe",
+  "renderer": "native",
+  "entry": "./games/dinowalksim/game.js"
+}

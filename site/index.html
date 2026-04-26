@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <title>wineframe — Windows games in Safari</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header id="topbar">
+      <div class="brand">wineframe</div>
+      <div id="status" class="status">idle</div>
+    </header>
+
+    <main id="stage">
+      <section id="launcher" hidden>
+        <h1>wineframe</h1>
+        <p class="tag">Drop a game zip, or pick a bundled one.</p>
+        <ul id="game-list"></ul>
+        <label class="drop" id="drop">
+          <input type="file" id="file" accept=".zip" hidden />
+          <span>Drop a .zip here, or tap to choose</span>
+        </label>
+        <p class="fineprint">
+          URL form: <code>?app=&lt;name&gt;&amp;p=&lt;Game.exe&gt;</code>
+        </p>
+      </section>
+
+      <section id="runner" hidden>
+        <div id="screen">
+          <canvas id="fb" width="800" height="600"></canvas>
+          <div id="term"></div>
+          <div id="boot-log"></div>
+        </div>
+        <div id="hud">
+          <button id="back">◀ Back</button>
+          <span id="phase">booting…</span>
+        </div>
+      </section>
+
+      <section id="crash" hidden>
+        <h2>Stopped</h2>
+        <pre id="crash-log"></pre>
+        <button id="crash-back">Back</button>
+      </section>
+    </main>
+
+    <script type="module" src="./loader.js"></script>
+  </body>
+</html>
