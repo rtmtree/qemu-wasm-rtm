@@ -14,6 +14,14 @@
 const ASSETS = {
   emModule:  "./assets/qemu-system-x86_64.js",
   rootfsGz:  "./assets/base-image.img.gz",
+  // Pre-built wineprefix as a standalone ext4 disk image, attached as
+  // /dev/vdb. Splitting the prefix off the rootfs lets each MEMFS file
+  // live in its own JS Uint8Array — V8 caps a single typed array around
+  // ~1.9 GB on 64-bit Chrome, so the combined ~2.5 GB image we'd need
+  // for a single-disk pre-extracted prefix doesn't fit, but two ~700 MB
+  // arrays each fit comfortably. init.sh in the guest mounts /dev/vdb
+  // and points WINEPREFIX at it, skipping the slow `tar -xzf` step.
+  prefixGz:  "./assets/wine-prefix.img.gz",
   loadJS:    [
     "./assets/load-kernel.js",
     "./assets/load-initramfs.js",
@@ -56,6 +64,8 @@ function buildArgs({ appName, exe }) {
     ].join(" "),
     "-drive", "id=root,file=/pack-rootfs/disk-rootfs.img,format=raw,if=none",
     "-device", "virtio-blk-pci,drive=root",
+    "-drive", "id=prefix,file=/pack-prefix/wine-prefix.img,format=raw,if=none",
+    "-device", "virtio-blk-pci,drive=prefix",
     "-virtfs", "local,path=/.wasmenv,mount_tag=wasm0,security_model=mapped-file,id=wasm0",
     "-netdev", "socket,id=vmnic,connect=localhost:8888",
     "-device", "virtio-net-pci,netdev=vmnic",
@@ -201,24 +211,27 @@ export async function startRuntime({ stage, appName, exe, log, terminalEl }) {
   const bridge = await startBridge({ stage, log });
   Module.websocket = { url: bridge.url };
 
-  // 2. Stream the rootfs straight into MEMFS at preRun time. We hold an
-  // Emscripten run dependency open until the stream completes so the
-  // module's main() is suspended on our async write.
+  // 2. Stream the rootfs + wineprefix images straight into MEMFS at
+  // preRun time. We hold one run dependency per image so the module's
+  // main() is suspended until both are written. Streams run in
+  // parallel so the prefix arrives during/before the rootfs decompress
+  // finishes.
   Module.preRun.push((m) => {
-    m.addRunDependency("rootfs-stream");
     try { m.FS.mkdir("/.wasmenv"); } catch {}
     m.FS.writeFile("/.wasmenv/app", JSON.stringify({ appName, exe }));
-    streamGzToFS({
-      url:    ASSETS.rootfsGz,
-      fsPath: "/pack-rootfs/disk-rootfs.img",
-      FS:     m.FS,
-      log,
-    })
-      .then(() => m.removeRunDependency("rootfs-stream"))
-      .catch((e) => {
-        log(`[runtime] rootfs stream failed: ${e.message || e}`);
-        m.removeRunDependency("rootfs-stream");
-      });
+
+    const stream = (key, url, fsPath) => {
+      m.addRunDependency(key);
+      streamGzToFS({ url, fsPath, FS: m.FS, log })
+        .then(() => m.removeRunDependency(key))
+        .catch((e) => {
+          log(`[runtime] ${key} failed: ${e.message || e}`);
+          m.removeRunDependency(key);
+        });
+    };
+
+    stream("rootfs-stream", ASSETS.rootfsGz, "/pack-rootfs/disk-rootfs.img");
+    stream("prefix-stream", ASSETS.prefixGz, "/pack-prefix/wine-prefix.img");
   });
 
   // 3. xterm + xterm-pty for the console.
@@ -259,7 +272,216 @@ export async function startRuntime({ stage, appName, exe, log, terminalEl }) {
   // <canvas id="fb">.
   startFramebufferPump(Module, log);
 
+  // 6. Input forwarding — canvas mouse/key events get appended as text
+  // lines to /.wasmenv/wf-input.txt (which the guest sees over 9P at
+  // /var/host/wf-input.txt). A daemon there reads new lines and replays
+  // them via xdotool to the X server.
+  startInputForward(Module, log);
+
   return { instance, bridge };
+}
+
+function startInputForward(Module, log) {
+  const canvas = document.querySelector("#fb");
+  if (!canvas) return;
+  const FS = Module.FS;
+  const PATH = "/.wasmenv/wf-input.txt";
+
+  // Create the file fresh so the guest daemon's "skip already-read
+  // bytes" counter starts at 0.
+  try { FS.writeFile(PATH, ""); } catch (e) {
+    log(`[input] could not create ${PATH}: ${e.message || e}`);
+    return;
+  }
+
+  // Open once for append-style writes
+  let stream;
+  try { stream = FS.open(PATH, "a"); }
+  catch (e) {
+    log(`[input] could not open ${PATH} for append: ${e.message || e}`);
+    return;
+  }
+
+  // Continuous mousemove tracking is intentionally OFF: every mousemove
+  // would write to MEMFS and the guest's 200 ms poll would chase each
+  // event through xdotool, eating CPU that the wine guest could be
+  // using to boot. Instead we send only on click (snap-and-tap) plus
+  // explicit nudges from the on-page D-pad.
+  let writeQueue = "";
+  let flushTimer = null;
+  let totalBytes = 0;
+  let totalEvents = 0;
+  let firstDownLogged = false;
+  let firstKeyLogged = false;
+  // Tracked virtual cursor — the position the D-pad is "holding" between
+  // canvas clicks. Initialised to the canvas centre.
+  let cursorX = Math.floor(canvas.width / 2);
+  let cursorY = Math.floor(canvas.height / 2);
+  const enc = new TextEncoder();
+
+  function scheduleFlush() {
+    if (flushTimer) return;
+    flushTimer = setTimeout(flush, 30);
+  }
+  function flush() {
+    flushTimer = null;
+    if (!writeQueue) return;
+    const bytes = enc.encode(writeQueue);
+    try {
+      const sz = FS.stat(PATH).size;
+      // Use FS.write at end-of-file offset for explicit append
+      FS.write(stream, bytes, 0, bytes.length, sz);
+      totalBytes += bytes.length;
+      totalEvents += writeQueue.split("\n").length - 1;
+    } catch (e) {
+      // Re-open if stream went stale
+      try {
+        FS.close(stream);
+      } catch {}
+      try { stream = FS.open(PATH, "a"); } catch {}
+    }
+    writeQueue = "";
+  }
+
+  function canvasCoord(e) {
+    const r = canvas.getBoundingClientRect();
+    const x = Math.max(0, Math.min(canvas.width - 1,
+      Math.floor((e.clientX - r.left) * canvas.width / r.width)));
+    const y = Math.max(0, Math.min(canvas.height - 1,
+      Math.floor((e.clientY - r.top) * canvas.height / r.height)));
+    return [x, y];
+  }
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  // Emit MV to the current (cursorX, cursorY). Used by both the canvas
+  // click handler (which sets the cursor first) and the D-pad arrows.
+  function emitMove() {
+    writeQueue += `MV ${cursorX} ${cursorY}\n`;
+    scheduleFlush();
+    updateIndicator();
+  }
+  function emitClick(btn) {
+    if (!firstDownLogged) {
+      firstDownLogged = true;
+      log(`[input] first click btn=${btn} at (${cursorX},${cursorY})`);
+    }
+    writeQueue += `MV ${cursorX} ${cursorY}\nDOWN ${btn}\nUP ${btn}\n`;
+    scheduleFlush();
+    updateIndicator();
+  }
+
+  // Visual cursor indicator — a small CSS-positioned crosshair on top
+  // of the canvas so users can see where the D-pad is parked.
+  let indicator = null;
+  function ensureIndicator() {
+    if (indicator) return;
+    const screen = canvas.parentElement;
+    if (!screen) return;
+    indicator = document.createElement("div");
+    indicator.id = "wf-cursor";
+    indicator.textContent = "+";
+    screen.appendChild(indicator);
+  }
+  function updateIndicator() {
+    ensureIndicator();
+    if (!indicator) return;
+    const r = canvas.getBoundingClientRect();
+    const sr = canvas.parentElement.getBoundingClientRect();
+    const px = (r.left - sr.left) + cursorX * (r.width / canvas.width);
+    const py = (r.top  - sr.top ) + cursorY * (r.height / canvas.height);
+    indicator.style.left = `${px}px`;
+    indicator.style.top  = `${py}px`;
+  }
+
+  canvas.addEventListener("mousedown", (e) => {
+    const [x, y] = canvasCoord(e);
+    cursorX = x; cursorY = y;
+    emitClick(e.button + 1);
+    e.preventDefault();
+  });
+  // mouseup is intentionally unused — emitClick already issues DOWN+UP.
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+  // D-pad: 4 direction buttons + a click button. Each direction nudges
+  // the tracked cursor by `step` px; holding repeats every 80 ms.
+  const dpad = document.querySelector("#dpad");
+  if (dpad) {
+    const STEP = 8;
+    const nudge = (dx, dy) => {
+      cursorX = clamp(cursorX + dx, 0, canvas.width  - 1);
+      cursorY = clamp(cursorY + dy, 0, canvas.height - 1);
+      emitMove();
+    };
+    const dirs = {
+      "up":    [ 0, -STEP],
+      "down":  [ 0,  STEP],
+      "left":  [-STEP, 0],
+      "right": [ STEP, 0],
+    };
+    for (const btn of dpad.querySelectorAll("[data-dir]")) {
+      const dir = btn.dataset.dir;
+      let timer = null;
+      const start = (e) => {
+        e.preventDefault();
+        if (dir === "click") { emitClick(1); return; }
+        if (!dirs[dir]) return;
+        nudge(...dirs[dir]);
+        // Hold-to-repeat after a short delay
+        timer = setTimeout(function rep() {
+          if (!dirs[dir]) return;
+          nudge(...dirs[dir]);
+          timer = setTimeout(rep, 80);
+        }, 200);
+      };
+      const stop = (e) => { e?.preventDefault?.(); if (timer) { clearTimeout(timer); timer = null; } };
+      btn.addEventListener("mousedown", start);
+      btn.addEventListener("touchstart", start, { passive: false });
+      btn.addEventListener("mouseup", stop);
+      btn.addEventListener("mouseleave", stop);
+      btn.addEventListener("touchend", stop);
+      btn.addEventListener("touchcancel", stop);
+    }
+    // Place the indicator at the initial centre.
+    setTimeout(updateIndicator, 0);
+  }
+
+  // Make the canvas grab focus on click so keys go to it
+  canvas.tabIndex = 0;
+  canvas.style.cursor = "crosshair";
+  canvas.style.outline = "none";
+
+  canvas.addEventListener("keydown", (e) => {
+    // Map common keys to xdotool key names
+    const map = {
+      "Enter": "Return", "Escape": "Escape", "Tab": "Tab",
+      "Backspace": "BackSpace", " ": "space",
+      "ArrowUp": "Up", "ArrowDown": "Down",
+      "ArrowLeft": "Left", "ArrowRight": "Right",
+    };
+    const k = map[e.key] || e.key;
+    if (k.length > 0) {
+      if (!firstKeyLogged) {
+        firstKeyLogged = true;
+        log(`[input] first keydown key=${k}`);
+      }
+      writeQueue += `KEY ${k}\n`;
+      scheduleFlush();
+    }
+    e.preventDefault();
+  });
+
+  log("[input] click-only mouse + keyboard + D-pad → /.wasmenv/wf-input.txt");
+  window.__wfInput = {
+    get queueLen() { return writeQueue.length; },
+    get totalBytes() { return totalBytes; },
+    get totalEvents() { return totalEvents; },
+    get cursor() { return [cursorX, cursorY]; },
+    nudge(dx, dy) { cursorX = clamp(cursorX + dx, 0, canvas.width - 1);
+                    cursorY = clamp(cursorY + dy, 0, canvas.height - 1);
+                    emitMove(); },
+    click(btn = 1) { emitClick(btn); },
+  };
 }
 
 function startFramebufferPump(Module, log) {

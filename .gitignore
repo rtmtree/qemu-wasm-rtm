@@ -20,3 +20,8 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+
+site/boxedwine
+site/lighthouse
+site/ONE_SHOT

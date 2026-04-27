@@ -327,6 +327,7 @@ const RUNTIME_FILES = [
   "assets/qemu-system-x86_64.js",
   "assets/qemu-system-x86_64.worker.js",
   "assets/base-image.img.gz",
+  "assets/wine-prefix.img.gz",
   "assets/load-kernel.js",
   "assets/load-kernel.data",
   "assets/load-initramfs.js",

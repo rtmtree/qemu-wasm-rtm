@@ -1,0 +1,4 @@
+now, the game render on wasm (./site/lighthouse/Ludum Dare 59 AGS.exe). 
+but the mouse in the emulator is not tracked.
+
+create a plan in plan-mouse-track.md
