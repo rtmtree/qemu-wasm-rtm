@@ -447,6 +447,43 @@ export async function startRuntime({ stage, appName, exe, log, terminalEl, resto
   // 7. Snapshot save/load wiring.
   wireSnapshotButtons({ Module, master, slave, appName, log, writeStdin });
 
+  // 8. Auto-resume after a snapshot restore.
+  //
+  // Our save flow does Ctrl-A,c → stop → migrate → cont → Ctrl-A,c.
+  // The migrate captures state at the moment of `stop`, so the
+  // *saved* state is: VM=paused, chardev mux=monitor side.
+  //
+  // After `-incoming file:` finishes, QEMU restores that exact state.
+  // Two consequences:
+  //   1. VM is paused, so the guest's fb-pump emits nothing.
+  //   2. Even if it did, frames written to /dev/console land on the
+  //      serial frontend of the mux, but the mux is on the *monitor*
+  //      side, so the bytes are buffered inside QEMU and don't reach
+  //      our slave.write tap.
+  //
+  // Fix: send `cont` (resumes the VM, lands at the monitor since
+  // mux=monitor) then `\x01c` (toggles mux back to serial so the
+  // buffered frames flush and ongoing fb-pump output streams to JS).
+  //
+  // Wait 4 s for QEMU to finish loading the snapshot; under TCG this
+  // is fast (memcpy + device-state replay) but still non-zero.
+  if (restoreBytes) {
+    setTimeout(() => {
+      log(`[runtime] restore: sending "cont" to resume the saved-paused VM`);
+      writeStdin("cont\n");
+      setTimeout(() => {
+        log(`[runtime] restore: toggling chardev mux back to serial`);
+        writeStdin("\x01c");
+        // Optional second nudge in case the first attempt landed
+        // before QEMU finished loading the migration stream. Sending
+        // "cont" again is a no-op if VM already running.
+        setTimeout(() => {
+          writeStdin("cont\n");
+        }, 3000);
+      }, 800);
+    }, 4000);
+  }
+
   return { instance, bridge };
 }
 

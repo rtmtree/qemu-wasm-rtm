@@ -7,9 +7,17 @@
 // We never cache HTML/CSS/JS — those need to update when we publish.
 // Only the heavy binary blobs are worth saving.
 
-// v20 — Snapshot, take 3 — Path B (Path A failed: device_del didn't
-// unrealize virtio-9p in this wasm QEMU build, so the migration
-// blocker stayed up).
+// v21 — Restore auto-resume: saved state has VM=paused (we did `stop`
+// before migrate) AND chardev mux=monitor (we did Ctrl-A,c before
+// migrate). After -incoming, QEMU restores exactly that state, so
+// (a) VM stays paused → no fb-pump emission; (b) mux=monitor → even
+// if frames were emitting they'd be buffered on the serial frontend,
+// invisible to our slave.write tap. Fix: 4 s after QEMU starts in
+// restore mode, send `cont` (resumes VM, hits the monitor since
+// that's the active side) then `\x01c` (toggles mux back to serial,
+// flushing buffered fb-pump output). Plus a second `cont` 3 s later
+// in case the first attempt fired before QEMU finished loading.
+// v20 — Path B (input via stdin, no -virtfs).
 //   - QEMU args: VirtFS dropped entirely. No `-virtfs`, no `-fsdev`,
 //     no `-device virtio-9p-pci`. The migration blocker is gone.
 //   - JS input forwarder: bytes go through master.ldisc.writeFromLower
@@ -22,7 +30,7 @@
 //   - saveSnapshot: dropped the device_del block (no longer needed,
 //     and didn't work). Same probe → stop → migrate variants → gzip
 //     → download flow.
-const CACHE_NAME = "wineframe-runtime-v20";
+const CACHE_NAME = "wineframe-runtime-v21";
 const CACHEABLE = [
   /\/assets\/base-image\.img\.gz$/,
   /\/assets\/wine-prefix\.img\.gz$/,
