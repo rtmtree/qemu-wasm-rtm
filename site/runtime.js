@@ -126,10 +126,20 @@ function buildArgs({ appName, exe, restoreFromPath }) {
     "-device", "virtio-blk-pci,drive=root",
     "-drive", "id=prefix,file=/pack-prefix/wine-prefix.img,format=raw,if=none",
     "-device", "virtio-blk-pci,drive=prefix",
-    "-virtfs", "local,path=/.wasmenv,mount_tag=wasm0,security_model=mapped-file,id=wasm0",
     "-netdev", "socket,id=vmnic,connect=localhost:8888",
     "-device", "virtio-net-pci,netdev=vmnic",
   ];
+  // R7 (Path B): VirtFS is GONE permanently. virtio-9p registers an
+  // unconditional migration blocker the moment it's realized, and
+  // hot-unplug to remove the blocker (Path A) didn't work in this
+  // wasm QEMU build — likely because we have acpi=noirq + pci=noacpi
+  // in the kernel cmdline, which disables the ACPI hot-eject path
+  // the guest uses to ack a device_del. Without an ack, QEMU never
+  // unrealizes the device.
+  //
+  // Input is now forwarded over the same stdio chardev we already
+  // use (master.ldisc.writeFromLower → guest /dev/console). See
+  // startInputForward() and init.sh's input forwarder.
   if (restoreFromPath) {
     // Boot paused, then load a saved migration stream from MEMFS.
     // QEMU runs the VM automatically once the incoming stream finishes.
@@ -157,6 +167,25 @@ function appendScript(src) {
     s.onerror = () => reject(new Error(`load script: ${src}`));
     document.head.appendChild(s);
   });
+}
+
+// Inject bytes into QEMU's stdin via xterm-pty's line discipline. The
+// older xterm-pty API exposed `master.write` directly; the current API
+// expects clients to call `master.ldisc.writeFromLower([...bytes])`,
+// which is the exact path xterm uses when activated as an addon. Slave
+// reads pick the bytes up and emscripten's TTY surfaces them to QEMU.
+function makeWriteStdin(master) {
+  return (bytes) => {
+    if (!master?.ldisc?.writeFromLower) return;
+    let arr;
+    if (typeof bytes === "string") {
+      arr = new Array(bytes.length);
+      for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+    } else {
+      arr = Array.from(bytes);
+    }
+    master.ldisc.writeFromLower(arr);
+  };
 }
 
 // Read the decompressed size from a sidecar text file written at
@@ -291,8 +320,18 @@ export async function startRuntime({ stage, appName, exe, log, terminalEl, resto
     try {
       const r = await fetch(restoreUrl);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      restoreBytes = new Uint8Array(await r.arrayBuffer());
-      log(`[runtime] snapshot is ${(restoreBytes.length/1024/1024).toFixed(1)} MiB`);
+      // R6: snapshot files are now gzipped on save. Stream-decompress
+      // .gz files via DecompressionStream; uncompressed legacy `.snap`
+      // files load directly.
+      const isGz = restoreUrl.endsWith(".gz");
+      let stream = r.body;
+      if (isGz) {
+        log(`[runtime] decompressing gzipped snapshot stream`);
+        stream = stream.pipeThrough(new DecompressionStream("gzip"));
+      }
+      const ab = await new Response(stream).arrayBuffer();
+      restoreBytes = new Uint8Array(ab);
+      log(`[runtime] snapshot is ${(restoreBytes.length/1024/1024).toFixed(1)} MiB${isGz ? " (decompressed)" : ""}`);
     } catch (e) {
       log(`[runtime] snapshot fetch failed: ${e.message || e} — booting normally`);
       restoreBytes = null;
@@ -397,14 +436,16 @@ export async function startRuntime({ stage, appName, exe, log, terminalEl, resto
   // <canvas id="fb">.
   startFramebufferPump(Module, log);
 
-  // 6. Input forwarding — canvas mouse/key events get appended as text
-  // lines to /.wasmenv/wf-input.txt (which the guest sees over 9P at
-  // /var/host/wf-input.txt). A daemon there reads new lines and replays
-  // them via xdotool to the X server.
-  startInputForward(Module, log);
+  // 6. Input forwarding — canvas mouse/key events flow as text lines
+  // ("MV X Y", "DOWN btn", etc.) over the stdio chardev (= QEMU's
+  // serial in mux mode) into the guest's /dev/console, where init.sh's
+  // input forwarder reads them and dispatches via xdotool. Same path
+  // we use for monitor commands during snapshot save.
+  const writeStdin = makeWriteStdin(master);
+  startInputForward(Module, log, writeStdin);
 
   // 7. Snapshot save/load wiring.
-  wireSnapshotButtons({ Module, master, slave, appName, log });
+  wireSnapshotButtons({ Module, master, slave, appName, log, writeStdin });
 
   return { instance, bridge };
 }
@@ -427,10 +468,9 @@ export async function startRuntime({ stage, appName, exe, log, terminalEl, resto
 // back to `migrate "fd:N"` over a chardev pipe, or to the OPFS-backed
 // disk-only path. Watch the snap-status text + console for the actual
 // failure mode the first time it's tried.
-function wireSnapshotButtons({ Module, master, slave, appName, log }) {
+function wireSnapshotButtons({ Module, master, slave, appName, log, writeStdin }) {
   const FS = Module.FS;
   const SAVE_PATH_GUEST = "/tmp/snap.bin";          // path inside guest
-  const SAVE_PATH_HOST  = "/.wasmenv/snap.bin";     // path in MEMFS (9P share)
   const saveBtn   = document.querySelector("#snap-save");
   const loadBtn   = document.querySelector("#snap-load");
   const statusEl  = document.querySelector("#snap-status");
@@ -441,20 +481,9 @@ function wireSnapshotButtons({ Module, master, slave, appName, log }) {
     statusEl.dataset.kind = kind;
   };
 
-  // Send raw bytes to QEMU's stdin (= the pty master's input side).
-  // master is the xterm-pty Master; calling `write` on it injects bytes
-  // as if a user had typed them, which Emscripten's TTY then surfaces
-  // to QEMU on stdin.
-  const sendStdin = (bytes) => {
-    if (!master) return;
-    if (typeof bytes === "string") {
-      const arr = new Array(bytes.length);
-      for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-      master.write(arr);
-    } else {
-      master.write(Array.from(bytes));
-    }
-  };
+  // sendStdin is the snapshot-flow alias for the shared writeStdin —
+  // makes the older snapshot code easier to read.
+  const sendStdin = writeStdin;
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // Sniff QEMU's output for a marker (e.g., "(qemu)" prompt or
@@ -489,104 +518,265 @@ function wireSnapshotButtons({ Module, master, slave, appName, log }) {
     };
   });
 
+  // Tap slave.write for the duration of a snapshot. Returns a getter
+  // for the captured bytes-as-string so the caller can show / log
+  // whatever QEMU echoed during the migrate flow. Kept separate from
+  // waitForMonitorMarker because that one rebinds slave.write per call,
+  // tearing down on first marker; we want a long-lived tap during the
+  // entire migrate, with the option to log the whole transcript.
+  //
+  // CRITICAL: in `-nographic` (= `-serial mon:stdio`) mode, the guest's
+  // serial output and the monitor's responses share one stdio chardev
+  // and BOTH arrive at slave.write. Toggling Ctrl-A,c only changes
+  // which frontend receives our STDIN bytes — it does not stop the
+  // guest from emitting serial output. Our fb-pump in the guest writes
+  // 410 KB of base64 every few seconds, which would otherwise drown
+  // tiny monitor responses (a "(qemu)" prompt is 7 bytes; "QEMU 8.2.0
+  // …" is ~50 bytes). We strip fb-pump's framed chunks from the tap
+  // buffer so the monitor signal survives.
+  function tapMonitorOutput() {
+    let buf = "";
+    const orig = slave.write.bind(slave);
+    slave.write = function (data) {
+      const ret = orig(data);
+      let s = "";
+      if (Array.isArray(data)) {
+        for (let i = 0; i < data.length; i++) s += String.fromCharCode(data[i]);
+      } else if (typeof data === "string") s = data;
+      buf += s;
+      // 1) Strip complete fb-pump frames in one pass (fast path).
+      let prev = -1;
+      while (prev !== buf.length) {
+        prev = buf.length;
+        buf = buf.replace(/~~WFFB:\d+:\d+~~[\s\S]*?~~ENDWFFB:\d+~~\n?/g, "");
+      }
+      // 2) Defensive: any run of 200+ consecutive base64 chars is an
+      //    fb-pump frame body (complete or partial). Monitor responses
+      //    don't have runs that long; "QEMU 8.2.0 monitor - type help"
+      //    has spaces / punctuation throughout.
+      buf = buf.replace(/[A-Za-z0-9+/=]{200,}/g, "");
+      // 3) Strip orphan markers left over from partial frames that got
+      //    cut by step 2.
+      buf = buf.replace(/~~WFFB:\d+:\d+~~/g, "");
+      buf = buf.replace(/~~ENDWFFB:\d+~~\n?/g, "");
+      if (buf.length > 65536) buf = buf.slice(-32768);
+      return ret;
+    };
+    return {
+      get text() { return buf; },
+      contains(needle) { return buf.includes(needle); },
+      clear() { buf = ""; },
+      stop() { slave.write = orig; },
+    };
+  }
+
   async function saveSnapshot() {
     saveBtn.disabled = true;
     loadBtn.disabled = true;
     setStatus("entering monitor…", "busy");
+    // Tell startInputForward to swallow canvas mouse/key events for
+    // the duration of the snapshot. Without this, a stray click while
+    // the mux is on the monitor side would type "MV X Y\n" at the
+    // monitor prompt and clutter the transcript with "unknown command"
+    // errors.
+    window.__wfSnapshotInProgress = true;
+
+    // Long-lived tap so we can show whatever QEMU said if anything fails.
+    const tap = tapMonitorOutput();
+    const lastFew = (n = 200) => tap.text.slice(-n).replace(/\s+/g, " ").trim();
+
+    // The HMP "(qemu) " prompt is the most reliable monitor-presence
+    // signal. HMP's `info version` response is just the version
+    // number (`8.2.0\n`), without a "QEMU" prefix — that prefix only
+    // appears in the *welcome* banner shown when entering the monitor.
+    // So we look for the prompt OR the version string, not "QEMU".
+    const inMonitor = (s) =>
+      /\(qemu\)/.test(s) || /\b\d+\.\d+\.\d+\b/.test(s);
 
     try {
-      // 1. Switch to monitor (Ctrl-A, c). After this, fb-pump's serial
-      //    writes are queued by QEMU until we switch back, so they
-      //    won't corrupt monitor output.
-      sendStdin("\x01c");
-      // The monitor prints "(qemu) " when ready.
-      try { await waitForMonitorMarker(["(qemu)"], 3000); }
-      catch { /* maybe already in monitor — keep going */ }
+      // 1. Probe the monitor with `info version` BEFORE toggling, in case
+      //    we're already there. We strip ANSI line-editing escapes
+      //    ([K = erase to EOL, [D = cursor left) before the regex —
+      //    HMP's readline-style echo writes our typed line with cursor
+      //    redraws, which would otherwise confuse simple regex matches.
+      tap.clear();
+      sendStdin("info version\n");
+      await sleep(500);
+      const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+      const beforeProbe = stripAnsi(lastFew(500));
+      const inMonitorAlready = inMonitor(beforeProbe);
+      log(`[snap] mux probe (no toggle): ${beforeProbe || "(no echo)"}`);
 
-      // 2. Stop the VM so the snapshot is consistent.
+      // 2. If we don't already see a monitor-flavoured response, switch
+      //    via Ctrl-A,c. Send the two bytes separately (with a small
+      //    gap) so even mux implementations that read a byte at a time
+      //    process the prefix before the command char.
+      if (!inMonitorAlready) {
+        tap.clear();
+        setStatus("entering monitor (Ctrl-A,c)…", "busy");
+        sendStdin("\x01");
+        await sleep(50);
+        sendStdin("c");
+        await sleep(50);
+        sendStdin("\n"); // newline forces the prompt to redraw on most builds
+        // Wait up to 3 s for the welcome banner ("QEMU x.x.x …") OR
+        // the "(qemu)" prompt to appear.
+        let sawPrompt = false;
+        for (let i = 0; i < 30; i++) {
+          const txt = stripAnsi(tap.text);
+          if (/\(qemu\)/.test(txt) || /QEMU\s+\d+\.\d+\.\d+/.test(txt)) {
+            sawPrompt = true; break;
+          }
+          await sleep(100);
+        }
+        log(`[snap] after Ctrl-A,c: ${stripAnsi(lastFew(300))}`);
+        if (!sawPrompt) {
+          log(`[snap] WARNING: never saw "(qemu)" prompt — Ctrl-A,c may not toggle the mux in this wasm QEMU build. Continuing anyway.`);
+        }
+      } else {
+        log(`[snap] already in monitor — skipping Ctrl-A,c`);
+      }
+
+      // 3. Re-probe with `info version` to confirm bytes reach the
+      //    monitor. The response is `<version>\n` followed by a fresh
+      //    `(qemu) ` prompt — either is sufficient evidence.
+      tap.clear();
+      sendStdin("info version\n");
+      await sleep(500);
+      const probe2 = stripAnsi(lastFew(500));
+      log(`[snap] post-toggle probe: ${probe2 || "(no echo)"}`);
+      if (!inMonitor(probe2)) {
+        setStatus("monitor unreachable — see log", "err");
+        log(`[snap] FAIL: no "(qemu)" prompt or version number after "info version". Bytes are reaching the guest serial, not the monitor. Tap captured: ${tap.text.length} bytes`);
+        return;
+      }
+
+      // 4. Pause the VM so the snapshot is consistent.
       setStatus("pausing VM…", "busy");
+      tap.clear();
       sendStdin("stop\n");
-      await sleep(150);
+      await sleep(300);
+      log(`[snap] after stop: ${lastFew(200)}`);
 
-      // 3. Make sure /tmp/snap.bin doesn't exist on the host MEMFS,
-      //    so we can detect when migrate finishes by polling its size.
-      try { FS.unlink(SAVE_PATH_HOST); } catch {}
-
-      // 4. Migrate to a file. Try `file:` first (file backend), fall
-      //    back to `exec:` if that's not in this build.
-      // The guest writes to /tmp/snap.bin which is guest-local (NOT
-      //    9P-shared by default), so we need to write to a 9P-shared
-      //    path. /var/host/* on the guest is 9P-mapped to /.wasmenv/*
-      //    on the host. So have the guest write into /var/host/snap.bin,
-      //    which appears on the host at /.wasmenv/snap.bin.
-      // BUT init.sh notes "9P writes are broken in this qemu-wasm
-      //    build" — so guest-side writes via 9P won't propagate to the
-      //    host MEMFS. Workaround: write the migrate stream to the
-      //    guest's /tmp/snap.bin first, and accept that we can't read
-      //    it back without a working 9P write path.
-      //
-      // For the actual MVP, we tell QEMU to write directly to a host
-      // path via the `file:` URI. Since the host filesystem visible to
-      // QEMU is its own MEMFS, /pack-snap/snap.bin resolves to MEMFS.
+      // 5. Migrate to a host-side MEMFS path. We use QEMU's own MEMFS
+      //    (`/pack-snap/snap.bin`), which is QEMU-process-local.
+      //    Note: in path B (R7) there's no -virtfs, so the migration
+      //    blocker that thwarted earlier attempts is gone.
       try { FS.mkdir("/pack-snap"); } catch {}
       const HOST_PACK = "/pack-snap/snap.bin";
       try { FS.unlink(HOST_PACK); } catch {}
 
-      setStatus("running migrate…", "busy");
-      sendStdin(`migrate "file:${HOST_PACK}"\n`);
-
-      // 5. Poll the host MEMFS file size — when it stops growing for
-      //    a few ticks, migrate is done.
-      let prev = -1, stable = 0, lastSize = 0;
-      for (let i = 0; i < 600; i++) {  // up to ~5 min
-        let sz = 0;
-        try { sz = FS.stat(HOST_PACK).size; } catch {}
-        if (sz > 0) {
-          setStatus(`migrating: ${(sz/1024/1024).toFixed(1)} MB`, "busy");
-          if (sz === prev) stable++; else { prev = sz; stable = 0; }
-          if (stable >= 6) { lastSize = sz; break; }
+      // Try a few migrate variants in order — QEMU's HMP parser has
+      // accepted slightly different syntaxes across versions, and this
+      // wasm build is `--without-default-features` so some backends
+      // are stripped.
+      const variants = [
+        `migrate -d file:${HOST_PACK}`,
+        `migrate file:${HOST_PACK}`,
+        `migrate "file:${HOST_PACK}"`,
+      ];
+      let lastSize = 0;
+      let usedVariant = "";
+      for (const cmd of variants) {
+        try { FS.unlink(HOST_PACK); } catch {}
+        setStatus(`running ${cmd}…`, "busy");
+        tap.clear();
+        sendStdin(cmd + "\n");
+        let sawError = false;
+        let prev = -1, stable = 0;
+        for (let i = 0; i < 30; i++) { // 15 s per variant
+          let sz = 0;
+          try { sz = FS.stat(HOST_PACK).size; } catch {}
+          if (sz > 0) {
+            setStatus(`migrating: ${(sz/1024/1024).toFixed(1)} MB`, "busy");
+            if (sz === prev) stable++; else { prev = sz; stable = 0; }
+            if (stable >= 6) { lastSize = sz; usedVariant = cmd; break; }
+          } else {
+            const t = tap.text;
+            if (t.includes("unknown command") || t.includes("Unknown command")
+                || t.includes("Migration failed") || t.includes("error:")) {
+              sawError = true;
+              log(`[snap] variant "${cmd}" rejected: ${lastFew(300)}`);
+              break;
+            }
+            if (i % 4 === 0) {
+              const tail = lastFew(120);
+              if (tail) setStatus(`waiting (${tail})`, "busy");
+            }
+          }
+          await sleep(500);
         }
-        await sleep(500);
+        if (lastSize > 0) break;
+        if (!sawError) {
+          log(`[snap] variant "${cmd}" produced 0 bytes after 15 s — trying next`);
+        }
       }
       if (lastSize === 0) {
-        // No bytes appeared — migrate file: backend probably not in this
-        // build. Surface the QEMU error log.
-        setStatus("migrate produced 0 bytes — see console", "err");
-        log("[snap] migrate \"file:…\" returned no data. The wasm QEMU build may not support the file: URI. Check the xterm for monitor errors.");
+        const tail = lastFew(800);
+        setStatus(`migrate failed — see log`, "err");
+        log(`[snap] all migrate variants failed. Last 800 bytes of monitor transcript:`);
+        log(`[snap]   ${tail || "(empty — monitor returned nothing)"}`);
+        log(`[snap] If you see no "QEMU 8.2.0" anywhere in this session, Ctrl-A,c isn't toggling the mux. If you see the version but no migrate output, "migrate file:" probably isn't compiled into this wasm QEMU build (--without-default-features strips many backends).`);
         // Attempt to leave the VM in a runnable state.
-        sendStdin("cont\n");
-        sendStdin("\x01c");  // back to serial
+        try { sendStdin("cont\n"); sendStdin("\x01c"); } catch {}
         return;
       }
 
       setStatus(`packing ${(lastSize/1024/1024).toFixed(1)} MB…`, "busy");
+      log(`[snap] success via "${usedVariant}" — ${lastSize} bytes`);
       const snapBytes = FS.readFile(HOST_PACK);
 
       // 6. Resume the VM and switch monitor back to serial so frames
-      //    flow to xterm again.
+      //    flow to xterm again. (Note: input via 9P is dead now since
+      //    we device_del'd the VirtFS share. The user can keep watching
+      //    but can't interact. Reload to load the snapshot for full
+      //    play.)
       sendStdin("cont\n");
       await sleep(100);
       sendStdin("\x01c");
 
-      // 7. Trigger browser download.
-      const blob = new Blob([snapBytes], { type: "application/octet-stream" });
+      // 7. Compress with gzip via DecompressionStream's twin. QEMU
+      //    migration files have a lot of structural redundancy and
+      //    typically compress 2-3x. A 200 MiB raw snapshot lands at
+      //    ~70 MiB compressed.
+      setStatus(`compressing…`, "busy");
+      const t0 = Date.now();
+      const compressedBuffer = await new Response(
+        new Blob([snapBytes]).stream().pipeThrough(new CompressionStream("gzip"))
+      ).arrayBuffer();
+      const compressedSize = compressedBuffer.byteLength;
+      log(`[snap] gzip: ${lastSize} → ${compressedSize} bytes `
+          + `(${((compressedSize / lastSize) * 100).toFixed(0)}%) in ${Date.now() - t0} ms`);
+
+      // 8. Trigger browser download.
+      const blob = new Blob([compressedBuffer], { type: "application/gzip" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `wineframe-${appName}.snap`;
+      a.download = `wineframe-${appName}.snap.gz`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
 
-      setStatus(`saved (${(lastSize/1024/1024).toFixed(1)} MB)`, "ok");
-      log(`[snap] saved ${lastSize} bytes → wineframe-${appName}.snap`);
+      // 9. Free the MEMFS copy of the snapshot — keeping it tied up
+      //    ~200 MB of MEMFS that nothing else uses.
+      try { FS.unlink(HOST_PACK); } catch {}
+
+      setStatus(`saved ${(compressedSize/1024/1024).toFixed(1)} MB (raw ${(lastSize/1024/1024).toFixed(1)} MB)`, "ok");
+      log(`[snap] saved → wineframe-${appName}.snap.gz (${compressedSize} bytes gz, ${lastSize} bytes raw)`);
+      log(`[snap] NOTE: input via 9P is dead in this session (we device_del'd VirtFS to allow migrate). Reload the page and use Load Snapshot to restore + resume with input working.`);
     } catch (e) {
       setStatus(`save failed: ${e.message || e}`, "err");
       log(`[snap] save failed: ${e.message || e}`);
       // Best-effort: try to leave VM running and back on the serial mux.
       try { sendStdin("cont\n"); sendStdin("\x01c"); } catch {}
     } finally {
+      // CRITICAL: release the slave.write override so fb-pump's tap and
+      // the xterm display see traffic again. Without this we'd silently
+      // leak the closure on every snapshot attempt.
+      try { tap.stop(); } catch {}
+      window.__wfSnapshotInProgress = false;
       saveBtn.disabled = false;
       loadBtn.disabled = false;
     }
@@ -597,18 +787,30 @@ function wireSnapshotButtons({ Module, master, slave, appName, log }) {
     loadBtn.disabled = true;
     setStatus("checking snapshot…", "busy");
     try {
-      // Convention: place the snapshot file at site/assets/<app>.snap
-      // (i.e., served at ./assets/<app>.snap). On click we set a
-      // sessionStorage flag and reload — the new page run will pick up
-      // the snapshot before QEMU starts and add `-incoming` to its args.
-      const url = `./assets/${appName}.snap`;
-      const head = await fetch(url, { method: "HEAD" }).catch(() => null);
-      if (!head || !head.ok) {
-        setStatus(`no snapshot at ${url}`, "err");
-        log(`[snap] no snapshot at ${url} — Save Snapshot first, then drop the file into site/assets/`);
+      // Convention: place the snapshot file at site/assets/<app>.snap.gz
+      // (preferred — that's what Save Snapshot now produces) or the
+      // legacy uncompressed `.snap`. On click we set a sessionStorage
+      // flag and reload — the new page run will pick up the snapshot
+      // before QEMU starts and add `-incoming` to its args.
+      const candidates = [
+        `./assets/${appName}.snap.gz`,
+        `./assets/${appName}.snap`,
+      ];
+      let url = null;
+      let sz = 0;
+      for (const c of candidates) {
+        const head = await fetch(c, { method: "HEAD" }).catch(() => null);
+        if (head && head.ok) {
+          url = c;
+          sz = Number(head.headers.get("Content-Length") || 0);
+          break;
+        }
+      }
+      if (!url) {
+        setStatus(`no snapshot found`, "err");
+        log(`[snap] no snapshot at ${candidates.join(" or ")} — Save Snapshot first, then drop the file into site/assets/`);
         return;
       }
-      const sz = Number(head.headers.get("Content-Length") || 0);
       sessionStorage.setItem("wf-restore-from", url);
       setStatus(`reloading with snapshot (${(sz/1024/1024).toFixed(1)} MB)…`, "busy");
       log(`[snap] restoring from ${url} on next boot`);
@@ -631,32 +833,17 @@ function wireSnapshotButtons({ Module, master, slave, appName, log }) {
   window.__wfSnap = { saveSnapshot, loadSnapshot, sendStdin };
 }
 
-function startInputForward(Module, log) {
+function startInputForward(Module, log, writeStdin) {
   const canvas = document.querySelector("#fb");
   if (!canvas) return;
-  const FS = Module.FS;
-  const PATH = "/.wasmenv/wf-input.txt";
 
-  // Create the file fresh so the guest daemon's "skip already-read
-  // bytes" counter starts at 0.
-  try { FS.writeFile(PATH, ""); } catch (e) {
-    log(`[input] could not create ${PATH}: ${e.message || e}`);
-    return;
-  }
-
-  // Open once for append-style writes
-  let stream;
-  try { stream = FS.open(PATH, "a"); }
-  catch (e) {
-    log(`[input] could not open ${PATH} for append: ${e.message || e}`);
-    return;
-  }
-
-  // Continuous mousemove tracking is intentionally OFF: every mousemove
-  // would write to MEMFS and the guest's 200 ms poll would chase each
-  // event through xdotool, eating CPU that the wine guest could be
-  // using to boot. Instead we send only on click (snap-and-tap) plus
-  // explicit nudges from the on-page D-pad.
+  // R7: input is now sent over QEMU's stdio (= /dev/console in the
+  // guest) instead of via 9P file polling. Same lines as before
+  // (`MV X Y\n`, `DOWN btn\n`, `UP btn\n`, `KEY name\n`); init.sh's
+  // input forwarder reads them with a blocking `read line` loop on
+  // /dev/console and dispatches via xdotool. Switching transports
+  // lets us drop -virtfs entirely, which lifts QEMU's hard-coded
+  // migration blocker — without this Save Snapshot can't migrate.
   let writeQueue = "";
   let flushTimer = null;
   let totalBytes = 0;
@@ -667,7 +854,6 @@ function startInputForward(Module, log) {
   // canvas clicks. Initialised to the canvas centre.
   let cursorX = Math.floor(canvas.width / 2);
   let cursorY = Math.floor(canvas.height / 2);
-  const enc = new TextEncoder();
 
   function scheduleFlush() {
     if (flushTimer) return;
@@ -676,19 +862,21 @@ function startInputForward(Module, log) {
   function flush() {
     flushTimer = null;
     if (!writeQueue) return;
-    const bytes = enc.encode(writeQueue);
-    try {
-      const sz = FS.stat(PATH).size;
-      // Use FS.write at end-of-file offset for explicit append
-      FS.write(stream, bytes, 0, bytes.length, sz);
-      totalBytes += bytes.length;
-      totalEvents += writeQueue.split("\n").length - 1;
-    } catch (e) {
-      // Re-open if stream went stale
+    // Don't shove input bytes at QEMU while a snapshot save is mid-
+    // flight — the mux is on the monitor side then, and our event
+    // lines would be parsed as monitor commands.
+    if (window.__wfSnapshotInProgress) {
+      writeQueue = "";
+      return;
+    }
+    if (typeof writeStdin === "function") {
       try {
-        FS.close(stream);
-      } catch {}
-      try { stream = FS.open(PATH, "a"); } catch {}
+        writeStdin(writeQueue);
+        totalBytes += writeQueue.length;
+        totalEvents += writeQueue.split("\n").length - 1;
+      } catch (e) {
+        if (totalEvents < 3) log(`[input] writeStdin failed: ${e.message || e}`);
+      }
     }
     writeQueue = "";
   }

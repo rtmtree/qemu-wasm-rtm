@@ -7,15 +7,22 @@
 // We never cache HTML/CSS/JS — those need to update when we publish.
 // Only the heavy binary blobs are worth saving.
 
-// v13 — Full round-4 revert after user reported 20+ min boot hangs.
-// Back to the round-3 known-good baseline for everything that runs
-// inside the guest (init.sh fb-pump cadence, watchdog defer,
-// input-forwarder poll, plain wine launch with no nice, original
-// pre-paint pattern) and for the QEMU args (tb-size 500, cmdline
-// stripped of all R4 additions). Kept the JS-only round-5 progress
-// UI improvements (phase model, exponential easing, % gauge,
-// elapsed/remaining display, opacity 0.5 overlay).
-const CACHE_NAME = "wineframe-runtime-v13";
+// v20 — Snapshot, take 3 — Path B (Path A failed: device_del didn't
+// unrealize virtio-9p in this wasm QEMU build, so the migration
+// blocker stayed up).
+//   - QEMU args: VirtFS dropped entirely. No `-virtfs`, no `-fsdev`,
+//     no `-device virtio-9p-pci`. The migration blocker is gone.
+//   - JS input forwarder: bytes go through master.ldisc.writeFromLower
+//     (= QEMU stdio = guest /dev/console) instead of writing to
+//     /.wasmenv/wf-input.txt. Suppressed during snapshot save so the
+//     event lines don't land at the monitor prompt.
+//   - init.sh: dropped the 9P modprobe + mount; replaced the
+//     file-polling input forwarder with a `read` loop on /dev/console
+//     that filters lines to MV/DOWN/UP/CLICK/KEY before xdotool.
+//   - saveSnapshot: dropped the device_del block (no longer needed,
+//     and didn't work). Same probe → stop → migrate variants → gzip
+//     → download flow.
+const CACHE_NAME = "wineframe-runtime-v20";
 const CACHEABLE = [
   /\/assets\/base-image\.img\.gz$/,
   /\/assets\/wine-prefix\.img\.gz$/,
