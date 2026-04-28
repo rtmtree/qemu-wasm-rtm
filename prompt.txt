@@ -2,3 +2,15 @@ now, the game render on wasm (./site/lighthouse/Ludum Dare 59 AGS.exe).
 but the mouse in the emulator is not tracked.
 
 create a plan in plan-mouse-track.md
+
+
+
+now, the game render on wasm (./site/lighthouse/Ludum Dare 59 AGS.exe). 
+but it really take time until the game render on the web canvas.
+
+fix it.
+
+look at ./plan-speed-game-boot-2.md for plan ref
+
+test on google chrome with MCP
+keep working until you get the best possible boot up speed of running game on web build

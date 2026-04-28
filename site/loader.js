@@ -31,6 +31,75 @@ const show = (name) => {
   }
 };
 
+// K12: boot progress overlay state.
+//
+// Stages and the log-line patterns we use to advance through them:
+//
+//   download    "[runtime] ./assets/...  N MiB / TOTAL MiB"  → progress %
+//   decompress  "[runtime] wrote N MiB of rootfs to MEMFS"   → progress %
+//   kernel      "[wineframe] runtime assets OK — starting guest"
+//                 then "[wf] booted Linux ..."
+//   wine        "[wf] launching wine explorer ..."
+//   game        first decoded fb-pump frame (window.__wfFb.frames > 0)
+//
+// Once the canvas has actual content, the overlay hides itself.
+const bootOverlay = {
+  el:       $("#boot-overlay"),
+  stageEl:  $("#bo-stage"),
+  fillEl:   $("#bo-fill"),
+  detailEl: $("#bo-detail"),
+  stage: "init",
+  hidden: true,
+  show() { this.el.hidden = false; this.hidden = false; },
+  hide() { this.el.hidden = true; this.hidden = true; },
+  set(stage, label, pct, detail) {
+    this.stage = stage;
+    this.stageEl.textContent = label;
+    if (pct === null || pct === undefined) {
+      this.fillEl.classList.add("indeterminate");
+      this.fillEl.style.width = "32%";
+    } else {
+      this.fillEl.classList.remove("indeterminate");
+      this.fillEl.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+    }
+    if (detail !== undefined) this.detailEl.textContent = detail;
+  },
+  // Drive the overlay from a single log line.
+  consume(line) {
+    if (this.hidden) return;
+    let m;
+    // Asset download: "[runtime] ./assets/foo.gz  123 MiB / 456 MiB"
+    if ((m = line.match(/\[runtime\] \.\/assets\/[^ ]+\s+([\d.]+) MiB \/ ([\d.]+) MiB/))) {
+      const cur = parseFloat(m[1]), tot = parseFloat(m[2]);
+      this.set("download", "Downloading runtime…", (cur / tot) * 100,
+               `${m[1]} / ${m[2]} MiB`);
+      return;
+    }
+    // MEMFS write progress
+    if ((m = line.match(/\[runtime\] wrote ([\d.]+) MiB of rootfs to MEMFS/))) {
+      // The total is logged separately ("rootfs target: N MiB"). We
+      // treat MEMFS writes as the same progress bar — by then download
+      // is also tracked.
+      this.set("decompress", "Decompressing into MEMFS…", null,
+               `${m[1]} MiB written`);
+      return;
+    }
+    if (line.includes("rootfs in MEMFS:")) {
+      this.set("kernel", "Booting Linux…", null, "kernel + initramfs");
+      return;
+    }
+    if (line.includes("[wf] booted Linux")) {
+      this.set("init", "Setting up Xvfb + Wine…", null, "init.sh");
+      return;
+    }
+    if (line.includes("[wf] launching wine explorer")) {
+      this.set("wine", "Starting Wine — this is the slow part…", null,
+               "AGS engine init under TCG");
+      return;
+    }
+  },
+};
+
 const bootLog = {
   el: $("#boot-log"),
   lines: [],
@@ -38,6 +107,7 @@ const bootLog = {
     this.lines.push(line);
     this.el.textContent = this.lines.join("\n");
     this.el.scrollTop = this.el.scrollHeight;
+    bootOverlay.consume(line);
   },
   clear() { this.lines = []; this.el.textContent = ""; },
 };
@@ -284,6 +354,19 @@ async function boot(stage) {
   status("booting QEMU…", "busy");
   $("#phase").textContent = "fetching runtime";
 
+  // K12: show the loading overlay. It self-hides once the framebuffer
+  // pump produces a real frame (polled below).
+  bootOverlay.show();
+  bootOverlay.set("download", "Loading runtime…", null, "starting…");
+  // Poll for the first decoded frame; auto-hide when the canvas has
+  // actual content from the guest.
+  const overlayPoll = setInterval(() => {
+    if (window.__wfFb?.frames > 0) {
+      bootOverlay.hide();
+      clearInterval(overlayPoll);
+    }
+  }, 500);
+
   const runtime = await probeRuntime();
   if (!runtime.ok) {
     bootLog.push("");
@@ -303,6 +386,14 @@ async function boot(stage) {
   $("#phase").textContent = "booting guest";
 
   const { startRuntime } = await import("./runtime.js");
+  // If the previous page run left a "restore from this URL" flag (the
+  // Load Snapshot button stores it before reload), pick that up. We
+  // clear it immediately so a normal reload doesn't loop.
+  const restoreUrl = sessionStorage.getItem("wf-restore-from") || null;
+  if (restoreUrl) {
+    sessionStorage.removeItem("wf-restore-from");
+    bootLog.push(`[wineframe] restoring from ${restoreUrl}`);
+  }
   try {
     // Also accept ?app=ONESHOT or ?app=LIGHTHOUSE without a zip — those
     // are baked into the rootfs.
@@ -312,6 +403,7 @@ async function boot(stage) {
       exe:       stage.exe,
       log:       (line) => bootLog.push(line),
       terminalEl: $("#term"),
+      restoreUrl,
     });
     status("running", "ok");
     $("#phase").textContent = "guest running";
@@ -371,9 +463,61 @@ $("#crash-back")?.addEventListener("click", () => {
   status("idle");
 });
 
+// K5: register the service worker so the big runtime assets are
+// cached on disk after the first cold boot. Subsequent visits hit the
+// Cache API instead of the network.
+if ("serviceWorker" in navigator && location.protocol !== "file:") {
+  navigator.serviceWorker.register("./sw.js").catch(() => {
+    // SW registration is opportunistic — no-op if the browser refuses.
+  });
+}
+
+// R-K16 (early asset preload): kick off in-flight fetches for the
+// heavy qemu runtime assets the moment we know the user wants the
+// qemu path (URL has ?app=LIGHTHOUSE or any non-native app). This
+// races the asset network fetches against the manifest fetch + JS
+// module imports + runtime probe, so by the time runtime.js calls
+// fetch() the request is already in the browser cache (or in-flight)
+// and dedupes. Saves ~1-3s of serial latency on cold boot.
+//
+// We hold strong refs to the response promises on a global scratch
+// object so runtime.js can grab them via window.__wfPreload[url]
+// instead of re-fetching. If runtime.js doesn't pick them up they
+// just become an unused cached fetch — still helps because the SW
+// will store the bytes for the actual fetch.
+function preloadRuntimeAssets() {
+  const urls = [
+    "./assets/base-image.img.gz",
+    "./assets/wine-prefix.img.gz",
+    "./assets/qemu-system-x86_64.wasm",
+    "./assets/qemu-system-x86_64.js",
+    "./assets/qemu-system-x86_64.worker.js",
+    "./assets/load-kernel.js",
+    "./assets/load-kernel.data",
+    "./assets/load-initramfs.js",
+    "./assets/load-initramfs.data",
+    "./assets/load-rom.js",
+    "./assets/load-rom.data",
+    "./assets/base-image.img.gz.size",
+    "./assets/wine-prefix.img.gz.size",
+  ];
+  window.__wfPreload = {};
+  for (const url of urls) {
+    try { window.__wfPreload[url] = fetch(url); } catch { /* opportunistic */ }
+  }
+}
+
 (async function main() {
   const q = parseQuery();
   if (q.app) {
+    // Per-app native renderer routing happens inside runFromUrl, but
+    // by the time we know it's native we'd have wasted the preload.
+    // Look at the manifest here cheaply (it's tiny + likely cached)
+    // to decide. If we can't reach it (offline, error), assume qemu
+    // path and preload — wasted bandwidth but only a few KB of risk.
+    const m = await fetch(`./games/${encodeURIComponent(q.app)}/manifest.json`)
+      .then((r) => r.ok ? r.json() : null).catch(() => null);
+    if (!m || m.renderer !== "native") preloadRuntimeAssets();
     await runFromUrl(q.app, q.p);
   } else {
     const manifest = await loadManifest();

@@ -32,6 +32,13 @@
           <canvas id="fb" width="800" height="600"></canvas>
           <div id="term"></div>
           <div id="boot-log"></div>
+          <div id="boot-overlay" hidden>
+            <div class="bo-stage" id="bo-stage">Loading runtime…</div>
+            <div class="bo-bar"><div class="bo-fill" id="bo-fill"></div></div>
+            <div class="bo-detail" id="bo-detail">starting…</div>
+            <div class="bo-hint">Keep this tab in the foreground — Chrome
+              throttles background tabs and the boot will pause.</div>
+          </div>
         </div>
         <div id="dpad" aria-label="virtual cursor controls">
           <button data-dir="up"    aria-label="up">↑</button>
@@ -43,6 +50,10 @@
         <div id="hud">
           <button id="back">◀ Back</button>
           <span id="phase">booting…</span>
+          <span class="hud-spacer"></span>
+          <button id="snap-save"  title="Pause VM, dump state, download as a file">Save Snapshot</button>
+          <button id="snap-load"  title="Restore VM from snapshot saved under site/assets/">Load Snapshot</button>
+          <span id="snap-status" class="snap-status"></span>
         </div>
       </section>
 
