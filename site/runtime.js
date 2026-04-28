@@ -37,9 +37,12 @@ function buildArgs({ appName, exe, restoreFromPath }) {
     // R2 reverted again: tb-size is in MiB. With TOTAL_MEMORY=2300 MiB
     // (the wasm linear memory cap), bumping tb-size to 2000 leaves
     // only ~300 MiB for guest RAM + heap + everything else — wine
-    // crashes with "memory access out of bounds" mid-init. 500 MiB
-    // cache fits comfortably and was the original choice for this
-    // reason.
+    // crashes with "memory access out of bounds" mid-init.
+    //
+    // R4-1 reverted: tried 768 to give the TCG cache more room for
+    // wine's DLL load loop. User reported 20+ min hang on cold boot;
+    // suspect transient OOM under contention with guest RAM + heap.
+    // Back to the round-3 known-good 500 MiB.
     "-accel", "tcg,tb-size=500",
     "-L", "/pack-rom/",
     "-kernel", "/pack-kernel/vmlinuz-virt",
@@ -103,6 +106,10 @@ function buildArgs({ appName, exe, restoreFromPath }) {
       // R-K9: disable IPv6 — wine and AGS only need IPv4 (and the
       // bridge worker only speaks IPv4). Skips ~1s of probing.
       "ipv6.disable=1",
+      // R4-2 fully reverted: even the "safe" tweaks (transparent_hugepage,
+      // printk.time) are out now. The user reported a 20-min hang and
+      // we want the cleanest possible round-3 baseline to compare
+      // against. Re-add one at a time only after verifying each.
     ].join(" "),
     // R-Q1: drop HPET emulation. Linux probes for it; we don't need it.
     "-no-hpet",
@@ -134,10 +141,18 @@ function buildArgs({ appName, exe, restoreFromPath }) {
 // Inject a classic <script src="..."> and resolve on load. Used for the
 // file_packager-generated load-*.js scripts which register FS preload
 // plugins by poking a window-scoped Module object.
+//
+// R4-12: explicit s.async = false preserves execution order even when
+// multiple scripts are appended back-to-back (which we now do in
+// parallel via Promise.all). Without this, dynamically-inserted scripts
+// default to async=true and execute in the order they finish
+// downloading — fine in isolation but a recipe for race conditions if
+// any of these load-*.js files share state.
 function appendScript(src) {
   return new Promise((resolve, reject) => {
     const s = document.createElement("script");
     s.src = src;
+    s.async = false;
     s.onload = () => resolve();
     s.onerror = () => reject(new Error(`load script: ${src}`));
     document.head.appendChild(s);
@@ -307,10 +322,11 @@ export async function startRuntime({ stage, appName, exe, log, terminalEl, resto
   };
   window.Module = Module;
 
+  // R4-12 reverted (boot-hang regression): back to serial script load
+  // followed by serial bridge spin-up. Parallel was a marginal win on
+  // a working boot but a possible source of subtle race conditions
+  // when load-*.js scripts mutate the shared Module object.
   for (const src of ASSETS.loadJS) await appendScript(src);
-
-  // 1. Start the bridge worker (stub — will hand off once bridge.wasm
-  // transport is wired).
   const bridge = await startBridge({ stage, log });
   Module.websocket = { url: bridge.url };
 

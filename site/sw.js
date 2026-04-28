@@ -7,13 +7,15 @@
 // We never cache HTML/CSS/JS — those need to update when we publish.
 // Only the heavy binary blobs are worth saving.
 
-// v8 — R-K24 reverted (wine --desktop= directly broke AGS init).
-// Final shipped set is R-K23 v2: WINEDLLOVERRIDES disables
-// services.exe + svchost.exe + plugplay.exe + winedevice.exe +
-// spoolsv.exe + conhost.exe + dllhost.exe + startupinfo.exe (and
-// the round-1 mscoree, mshtml, winemenubuilder defaults). Bump
-// when rootfs changes.
-const CACHE_NAME = "wineframe-runtime-v8";
+// v13 — Full round-4 revert after user reported 20+ min boot hangs.
+// Back to the round-3 known-good baseline for everything that runs
+// inside the guest (init.sh fb-pump cadence, watchdog defer,
+// input-forwarder poll, plain wine launch with no nice, original
+// pre-paint pattern) and for the QEMU args (tb-size 500, cmdline
+// stripped of all R4 additions). Kept the JS-only round-5 progress
+// UI improvements (phase model, exponential easing, % gauge,
+// elapsed/remaining display, opacity 0.5 overlay).
+const CACHE_NAME = "wineframe-runtime-v13";
 const CACHEABLE = [
   /\/assets\/base-image\.img\.gz$/,
   /\/assets\/wine-prefix\.img\.gz$/,

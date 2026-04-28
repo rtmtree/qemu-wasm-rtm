@@ -14,3 +14,19 @@ look at ./plan-speed-game-boot-2.md for plan ref
 
 test on google chrome with MCP
 keep working until you get the best possible boot up speed of running game on web build
+
+
+start investigating why mouse/cursor not map to the emulator
+and make it working
+use plan-mouse-track.md as starting point
+
+
+
+now, the game(./site/lighthouse/Ludum Dare 59 AGS.exe) render on wasm.
+but it take very long time until the game render on the web canvas.
+
+make it to be as quick as possible.
+
+look at ./plan-speed-game-boot-3.md for plan ref
+
+keep working until you get the best possible boot up speed of running game on web build

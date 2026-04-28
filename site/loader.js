@@ -31,70 +31,252 @@ const show = (name) => {
   }
 };
 
-// K12: boot progress overlay state.
+// Boot progress overlay (R5).
 //
-// Stages and the log-line patterns we use to advance through them:
+// Each phase has a target % at its end and a `typical` wall-clock duration
+// in seconds. The bar fills smoothly within a phase via time-based
+// interpolation: pct = phase.start + (phase.end − phase.start) · min(elapsed / typical, 0.97).
+// When a real-world marker (log line or fb frame) confirms a phase
+// transition, we snap forward to the next phase's start %. Phases never
+// move backwards.
 //
-//   download    "[runtime] ./assets/...  N MiB / TOTAL MiB"  → progress %
-//   decompress  "[runtime] wrote N MiB of rootfs to MEMFS"   → progress %
-//   kernel      "[wineframe] runtime assets OK — starting guest"
-//                 then "[wf] booted Linux ..."
-//   wine        "[wf] launching wine explorer ..."
-//   game        first decoded fb-pump frame (window.__wfFb.frames > 0)
+// Markers (in order, monotonic):
+//   preload    → streaming  : "[runtime] GET ./assets/" (first asset fetch begins)
+//   streaming  → kernel     : "rootfs in MEMFS:"        (decompress finished, kernel about to boot)
+//   kernel     → init       : "[wf] booted "            (init.sh running inside guest)
+//   init       → wine       : "[wf] launching wine"     (wine command issued)
+//   wine       → game       : window.__wfFb.frames >= 2 (first content change after pre-paint)
+//   game       → done       : window.__wfFb.frames >= 5 (steady frame flow → real game running)
 //
-// Once the canvas has actual content, the overlay hides itself.
+// Phase targets calibrated against observed cold-boot. Booting Linux
+// in particular has been observed running 5-15× the typical eta on
+// some setups, so within-phase progress uses an exponential decay
+// (1 - exp(-elapsed/eta * 1.2)): ~70 % of the phase span at elapsed=eta,
+// ~91 % at 2·eta, ~97 % at 3·eta, asymptoting toward but never
+// reaching 100 %. The bar always moves forward, even on slow boots.
+const PHASES = [
+  { id: "preload",    start: 0,  end: 5,   name: "Loading runtime",     eta: 3   },
+  { id: "streaming",  start: 5,  end: 28,  name: "Streaming assets",    eta: 45  },
+  { id: "kernel",     start: 28, end: 38,  name: "Booting Linux",       eta: 60  },
+  { id: "init",       start: 38, end: 48,  name: "Setting up Wine",     eta: 12  },
+  { id: "wine",       start: 48, end: 78,  name: "Loading Wine DLLs",   eta: 130 },
+  { id: "game",       start: 78, end: 99,  name: "Loading game",        eta: 90  },
+];
+
+function fmtClock(secs) {
+  if (!isFinite(secs) || secs < 0) secs = 0;
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
 const bootOverlay = {
   el:       $("#boot-overlay"),
   stageEl:  $("#bo-stage"),
   fillEl:   $("#bo-fill"),
   detailEl: $("#bo-detail"),
-  stage: "init",
+  pctEl:    null, // created lazily on first show
   hidden: true,
-  show() { this.el.hidden = false; this.hidden = false; },
-  hide() { this.el.hidden = true; this.hidden = true; },
-  set(stage, label, pct, detail) {
-    this.stage = stage;
-    this.stageEl.textContent = label;
-    if (pct === null || pct === undefined) {
-      this.fillEl.classList.add("indeterminate");
-      this.fillEl.style.width = "32%";
-    } else {
-      this.fillEl.classList.remove("indeterminate");
-      this.fillEl.style.width = `${Math.max(0, Math.min(100, pct))}%`;
-    }
-    if (detail !== undefined) this.detailEl.textContent = detail;
+  startTs: 0,
+  phaseStartTs: 0,
+  phaseIdx: 0,
+  manualFraction: null, // when set, overrides time-based fraction (e.g. real download bytes)
+  fillTimer: null,
+  totalEta: PHASES.reduce((s, p) => s + p.eta, 0),
+  framesPollTimer: null,
+
+  show() {
+    if (!this.hidden) return;
+    this.el.hidden = false;
+    this.hidden = false;
+    this.startTs = Date.now();
+    this.phaseStartTs = Date.now();
+    this.phaseIdx = 0;
+    this.manualFraction = null;
+    this.ensurePctEl();
+    this.startTickTimer();
+    this.startFramesPoll();
+    this.refresh();
   },
+
+  hide() {
+    if (this.hidden) return;
+    this.el.hidden = true;
+    this.hidden = true;
+    if (this.fillTimer) { clearInterval(this.fillTimer); this.fillTimer = null; }
+    if (this.framesPollTimer) { clearInterval(this.framesPollTimer); this.framesPollTimer = null; }
+  },
+
+  // Lazily insert a "<pct>% — m:ss elapsed" line below the stage label.
+  // We do this in JS rather than HTML so older overlay markup (which lacks
+  // the element) still works after a reload during development.
+  ensurePctEl() {
+    if (this.pctEl) return;
+    const el = document.createElement("div");
+    el.className = "bo-pct";
+    el.id = "bo-pct";
+    // Insert immediately after .bo-bar so the order is: stage / bar / pct / detail.
+    const bar = this.el.querySelector(".bo-bar");
+    bar.insertAdjacentElement("afterend", el);
+    this.pctEl = el;
+  },
+
+  enterPhase(id) {
+    const idx = PHASES.findIndex((p) => p.id === id);
+    if (idx < 0 || idx <= this.phaseIdx) return;
+    this.phaseIdx = idx;
+    this.phaseStartTs = Date.now();
+    this.manualFraction = null;
+    this.refresh();
+  },
+
+  // Set a real-data fraction (0..1) within the current phase. Used for the
+  // streaming phase where we have actual download bytes.
+  setManual(fraction) {
+    this.manualFraction = Math.max(0, Math.min(0.99, fraction));
+    this.refresh();
+  },
+
+  setDetail(text) {
+    if (this.hidden) return;
+    if (text !== undefined) {
+      this.detailEl.textContent = text;
+      this.lastDetail = text;
+    }
+  },
+
+  // Compute and apply the current bar % + texts.
+  refresh() {
+    if (this.hidden) return;
+    const phase = PHASES[this.phaseIdx];
+    const elapsedInPhase = (Date.now() - this.phaseStartTs) / 1000;
+    let frac;
+    if (this.manualFraction !== null) {
+      frac = this.manualFraction;
+    } else {
+      // Exponential decay — bar always moves forward, asymptotes to 0.99.
+      // At elapsed=eta the bar is ~70 % of the phase span; at 2·eta ~91 %;
+      // at 5·eta ~99.7 %. Clamp at 0.99 to never overrun the next phase.
+      const ratio = elapsedInPhase / phase.eta;
+      frac = Math.min(1 - Math.exp(-ratio * 1.2), 0.99);
+    }
+    const pct = phase.start + (phase.end - phase.start) * frac;
+    this.fillEl.classList.remove("indeterminate");
+    this.fillEl.style.width = `${pct.toFixed(1)}%`;
+    this.stageEl.textContent = phase.name + "…";
+    // If we've been in this phase well past its eta AND it's been at
+    // least 30 s, surface the wait so the user knows the bar isn't
+    // frozen — it's just a long phase. Short phases (eta ~3 s) would
+    // hit "2×" within seconds and produce noise; the absolute floor
+    // keeps the hint useful only when there's a real wait.
+    if (this.manualFraction === null
+        && elapsedInPhase > phase.eta * 2
+        && elapsedInPhase > 30) {
+      const overage = Math.floor(elapsedInPhase / phase.eta * 10) / 10;
+      this.detailEl.textContent =
+        `${this.lastDetail || phase.name}  ·  taking ${overage.toFixed(1)}× the typical time`;
+    }
+    if (this.pctEl) {
+      const elapsed = (Date.now() - this.startTs) / 1000;
+      // Estimated remaining = sum of remaining phase etas, scaled by how
+      // much of the current phase is left. Honest about uncertainty.
+      let remaining = (1 - frac) * phase.eta;
+      for (let i = this.phaseIdx + 1; i < PHASES.length; i++) {
+        remaining += PHASES[i].eta;
+      }
+      this.pctEl.textContent = `${pct.toFixed(0)}%  ·  ${fmtClock(elapsed)} elapsed`
+        + `  ·  ~${fmtClock(remaining)} remaining`;
+    }
+  },
+
+  startTickTimer() {
+    if (this.fillTimer) return;
+    this.fillTimer = setInterval(() => this.refresh(), 500);
+  },
+
+  // Watch the framebuffer pump for content frames. We can't hide on the
+  // first frame anymore — that's the pre-paint blue screen. Frames 2+ are
+  // real content (wine desktop, AGS title).
+  startFramesPoll() {
+    if (this.framesPollTimer) return;
+    this.framesPollTimer = setInterval(() => {
+      const frames = window.__wfFb?.frames || 0;
+      if (frames >= 2 && this.phaseIdx < PHASES.findIndex((p) => p.id === "game")) {
+        this.enterPhase("game");
+      }
+      if (frames >= 5) {
+        // Steady frame flow → real game is running. Hide the overlay.
+        this.hide();
+      }
+    }, 500);
+  },
+
   // Drive the overlay from a single log line.
   consume(line) {
     if (this.hidden) return;
     let m;
-    // Asset download: "[runtime] ./assets/foo.gz  123 MiB / 456 MiB"
-    if ((m = line.match(/\[runtime\] \.\/assets\/[^ ]+\s+([\d.]+) MiB \/ ([\d.]+) MiB/))) {
+    // Streaming: rootfs.img.gz progress is the dominant signal — map its
+    // download fraction onto the streaming phase's bar range.
+    if ((m = line.match(/\[runtime\] \.\/assets\/base-image\.img\.gz\s+([\d.]+) MiB \/ ([\d.]+) MiB/))) {
       const cur = parseFloat(m[1]), tot = parseFloat(m[2]);
-      this.set("download", "Downloading runtime…", (cur / tot) * 100,
-               `${m[1]} / ${m[2]} MiB`);
+      this.enterPhase("streaming");
+      if (tot > 0) this.setManual(cur / tot);
+      this.setDetail(`asset stream: ${cur.toFixed(0)} / ${tot.toFixed(0)} MiB`);
       return;
     }
-    // MEMFS write progress
+    // Other asset download lines (kernel, prefix) — use as a phase-enter
+    // signal only.
+    if (line.match(/\[runtime\] \.\/assets\/[^ ]+\s+[\d.]+ MiB \/ [\d.]+ MiB/)) {
+      this.enterPhase("streaming");
+      return;
+    }
+    if (line.match(/\[runtime\] GET \.\/assets\//)) {
+      this.enterPhase("streaming");
+      this.setDetail("opening fetch streams…");
+      return;
+    }
     if ((m = line.match(/\[runtime\] wrote ([\d.]+) MiB of rootfs to MEMFS/))) {
-      // The total is logged separately ("rootfs target: N MiB"). We
-      // treat MEMFS writes as the same progress bar — by then download
-      // is also tracked.
-      this.set("decompress", "Decompressing into MEMFS…", null,
-               `${m[1]} MiB written`);
+      this.enterPhase("streaming");
+      // While MEMFS writes are accumulating we're still in the streaming
+      // phase but past the pure-network portion — let the time-based
+      // interpolation finish the bar.
+      this.manualFraction = null;
+      this.setDetail(`MEMFS: ${m[1]} MiB written`);
       return;
     }
     if (line.includes("rootfs in MEMFS:")) {
-      this.set("kernel", "Booting Linux…", null, "kernel + initramfs");
+      this.enterPhase("kernel");
+      this.setDetail("kernel decompress + initramfs");
       return;
     }
-    if (line.includes("[wf] booted Linux")) {
-      this.set("init", "Setting up Xvfb + Wine…", null, "init.sh");
+    if (line.match(/^\[wf\] booted /) || line.includes("[wf] booted ")) {
+      this.enterPhase("init");
+      this.setDetail("mounts, daemons, Xvfb pre-paint");
       return;
     }
-    if (line.includes("[wf] launching wine explorer")) {
-      this.set("wine", "Starting Wine — this is the slow part…", null,
-               "AGS engine init under TCG");
+    if (line.includes("[wf] mounted /dev/vdb")) {
+      this.enterPhase("init");
+      this.setDetail("wineprefix mounted");
+      return;
+    }
+    if (line.includes("[wf] Xvfb starting")) {
+      this.enterPhase("init");
+      this.setDetail("X server starting…");
+      return;
+    }
+    if (line.includes("[wf] pre-painted Xvfb")) {
+      this.enterPhase("init");
+      this.setDetail("pre-paint pattern written");
+      return;
+    }
+    if (line.includes("[wf] fb-pump")) {
+      this.enterPhase("init");
+      this.setDetail("framebuffer pump online");
+      return;
+    }
+    if (line.includes("[wf] launching wine")) {
+      this.enterPhase("wine");
+      this.setDetail("wineboot + DLL load (TCG-bound)");
       return;
     }
   },
@@ -111,6 +293,11 @@ const bootLog = {
   },
   clear() { this.lines = []; this.el.textContent = ""; },
 };
+
+// Expose for live debugging from the devtools console — the boot overlay
+// is the user's only feedback during the multi-minute boot, so being able
+// to drive its phase machine from the console is useful.
+window.__wfBootOverlay = bootOverlay;
 
 function parseQuery() {
   const q = new URLSearchParams(location.search);
@@ -354,18 +541,11 @@ async function boot(stage) {
   status("booting QEMU…", "busy");
   $("#phase").textContent = "fetching runtime";
 
-  // K12: show the loading overlay. It self-hides once the framebuffer
-  // pump produces a real frame (polled below).
+  // R5: bootOverlay manages its own tick + frames-poll once shown,
+  // and self-hides when fb-pump emits real content frames (>=2; the
+  // first frame is the pre-paint blue, not actual game content).
   bootOverlay.show();
-  bootOverlay.set("download", "Loading runtime…", null, "starting…");
-  // Poll for the first decoded frame; auto-hide when the canvas has
-  // actual content from the guest.
-  const overlayPoll = setInterval(() => {
-    if (window.__wfFb?.frames > 0) {
-      bootOverlay.hide();
-      clearInterval(overlayPoll);
-    }
-  }, 500);
+  bootOverlay.setDetail("starting…");
 
   const runtime = await probeRuntime();
   if (!runtime.ok) {
@@ -430,10 +610,25 @@ const RUNTIME_FILES = [
 ];
 
 async function probeRuntime() {
+  // R4-7: parallel probe + reuse preloaded GET responses where possible.
+  // The original serial HEAD loop cost ~100-500 ms of latency before
+  // runtime.js could even start. Now: if the preloaded GET promise has
+  // already arrived (started by main() earlier), check its Response —
+  // reading .ok / .status doesn't consume the body, so runtime.js can
+  // still stream it via the same promise. For everything else, fire all
+  // HEADs in parallel.
   const missing = [];
-  for (const f of RUNTIME_FILES) {
-    const r = await fetch(f, { method: "HEAD" }).catch(() => null);
-    if (!r || !r.ok) missing.push(f);
+  const checks = await Promise.all(RUNTIME_FILES.map(async (f) => {
+    const url = `./${f}`;
+    const preloaded = window.__wfPreload?.[url];
+    if (preloaded) {
+      try { return await preloaded; } catch { /* fall through */ }
+    }
+    try { return await fetch(f, { method: "HEAD" }); } catch { return null; }
+  }));
+  for (let i = 0; i < RUNTIME_FILES.length; i++) {
+    const r = checks[i];
+    if (!r || !r.ok) missing.push(RUNTIME_FILES[i]);
   }
   return { ok: missing.length === 0, missing };
 }
